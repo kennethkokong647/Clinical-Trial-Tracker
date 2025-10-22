@@ -11,15 +11,10 @@
 (define-constant ERR_TRIAL_INACTIVE (err u107))
 (define-constant ERR_INVALID_MILESTONE_TYPE (err u108))
 (define-constant ERR_INVALID_REPUTATION_SCORE (err u109))
-(define-constant ERR_CONSENT_EXPIRED (err u110))
-(define-constant ERR_CONSENT_NOT_FOUND (err u111))
-(define-constant ERR_DATA_ACCESS_DENIED (err u112))
-(define-constant ERR_INVALID_CONSENT_TYPE (err u113))
 
 (define-data-var next-trial-id uint u1)
 (define-data-var token-supply uint u1000000)
 (define-data-var reputation-multiplier uint u10)
-(define-data-var next-consent-id uint u1)
 
 (define-map trials
   { trial-id: uint }
@@ -89,37 +84,6 @@
     last-updated-block: uint
   })
 
-(define-map data-consent
-  { consent-id: uint }
-  {
-    participant: principal,
-    trial-id: uint,
-    consent-type: (string-ascii 50),
-    data-categories: (string-ascii 200),
-    authorized-parties: (list 5 principal),
-    expiry-block: uint,
-    revokable: bool,
-    active: bool,
-    granted-block: uint
-  })
-
-(define-map participant-consent-registry
-  { participant: principal, trial-id: uint }
-  {
-    consent-ids: (list 10 uint),
-    total-consents: uint,
-    last-updated: uint
-  })
-
-(define-map data-access-log
-  { trial-id: uint, participant: principal, accessor: principal }
-  {
-    access-count: uint,
-    last-access-block: uint,
-    data-types-accessed: (string-ascii 300),
-    consent-id-used: uint
-  })
-
 (define-public (create-trial 
   (name (string-ascii 100))
   (description (string-ascii 500))
@@ -164,13 +128,6 @@
     (map-set trials 
       { trial-id: trial-id }
       (merge trial { current-participants: (+ (get current-participants trial) u1) }))
-    (map-set participant-consent-registry
-      { participant: tx-sender, trial-id: trial-id }
-      {
-        consent-ids: (list),
-        total-consents: u0,
-        last-updated: stacks-block-height
-      })
     (ok true)))
 
 (define-public (add-milestone 
@@ -266,94 +223,6 @@
     (asserts! (is-eq tx-sender (get researcher trial)) ERR_NOT_AUTHORIZED)
     (asserts! (not (get active trial)) ERR_TRIAL_INACTIVE)
     (try! (ft-transfer? trial-reward-token amount tx-sender CONTRACT_OWNER))
-    (ok true)))
-
-(define-public (grant-data-consent
-  (trial-id uint)
-  (consent-type (string-ascii 50))
-  (data-categories (string-ascii 200))
-  (authorized-parties (list 5 principal))
-  (duration-blocks uint)
-  (revokable bool))
-  (let
-    ((consent-id (var-get next-consent-id))
-     (participant-info (unwrap! (map-get? participants { trial-id: trial-id, participant: tx-sender }) ERR_NOT_PARTICIPANT))
-     (registry (default-to 
-       { consent-ids: (list), total-consents: u0, last-updated: u0 }
-       (map-get? participant-consent-registry { participant: tx-sender, trial-id: trial-id }))))
-    (asserts! (get active participant-info) ERR_NOT_PARTICIPANT)
-    (asserts! (or (is-eq consent-type "medical-data") 
-                  (is-eq consent-type "research-data") 
-                  (is-eq consent-type "anonymized-data")
-                  (is-eq consent-type "full-data")) ERR_INVALID_CONSENT_TYPE)
-    (map-set data-consent
-      { consent-id: consent-id }
-      {
-        participant: tx-sender,
-        trial-id: trial-id,
-        consent-type: consent-type,
-        data-categories: data-categories,
-        authorized-parties: authorized-parties,
-        expiry-block: (+ stacks-block-height duration-blocks),
-        revokable: revokable,
-        active: true,
-        granted-block: stacks-block-height
-      })
-    (map-set participant-consent-registry
-      { participant: tx-sender, trial-id: trial-id }
-      {
-        consent-ids: (unwrap-panic (as-max-len? (append (get consent-ids registry) consent-id) u10)),
-        total-consents: (+ (get total-consents registry) u1),
-        last-updated: stacks-block-height
-      })
-    (var-set next-consent-id (+ consent-id u1))
-    (ok consent-id)))
-
-(define-public (revoke-data-consent (consent-id uint))
-  (let
-    ((consent (unwrap! (map-get? data-consent { consent-id: consent-id }) ERR_CONSENT_NOT_FOUND)))
-    (asserts! (is-eq tx-sender (get participant consent)) ERR_NOT_AUTHORIZED)
-    (asserts! (get revokable consent) ERR_NOT_AUTHORIZED)
-    (asserts! (get active consent) ERR_CONSENT_NOT_FOUND)
-    (map-set data-consent
-      { consent-id: consent-id }
-      (merge consent { active: false }))
-    (ok true)))
-
-(define-public (access-participant-data
-  (trial-id uint)
-  (participant principal)
-  (data-types (string-ascii 300))
-  (consent-id uint))
-  (let
-    ((trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR_TRIAL_NOT_FOUND))
-     (consent (unwrap! (map-get? data-consent { consent-id: consent-id }) ERR_CONSENT_NOT_FOUND))
-     (access-log (default-to
-       { access-count: u0, last-access-block: u0, data-types-accessed: "", consent-id-used: u0 }
-       (map-get? data-access-log { trial-id: trial-id, participant: participant, accessor: tx-sender }))))
-    (asserts! (get active consent) ERR_CONSENT_EXPIRED)
-    (asserts! (<= stacks-block-height (get expiry-block consent)) ERR_CONSENT_EXPIRED)
-    (asserts! (is-eq (get participant consent) participant) ERR_DATA_ACCESS_DENIED)
-    (asserts! (is-eq (get trial-id consent) trial-id) ERR_DATA_ACCESS_DENIED)
-    (asserts! (is-some (index-of (get authorized-parties consent) tx-sender)) ERR_DATA_ACCESS_DENIED)
-    (map-set data-access-log
-      { trial-id: trial-id, participant: participant, accessor: tx-sender }
-      {
-        access-count: (+ (get access-count access-log) u1),
-        last-access-block: stacks-block-height,
-        data-types-accessed: data-types,
-        consent-id-used: consent-id
-      })
-    (ok true)))
-
-(define-public (update-consent-expiry (consent-id uint) (new-expiry-blocks uint))
-  (let
-    ((consent (unwrap! (map-get? data-consent { consent-id: consent-id }) ERR_CONSENT_NOT_FOUND)))
-    (asserts! (is-eq tx-sender (get participant consent)) ERR_NOT_AUTHORIZED)
-    (asserts! (get active consent) ERR_CONSENT_NOT_FOUND)
-    (map-set data-consent
-      { consent-id: consent-id }
-      (merge consent { expiry-block: (+ stacks-block-height new-expiry-blocks) }))
     (ok true)))
 
 (define-read-only (get-trial-info (trial-id uint))
@@ -497,27 +366,3 @@
           (if (>= score u100)
               "silver"
               "bronze"))))
-
-(define-read-only (get-consent-info (consent-id uint))
-  (map-get? data-consent { consent-id: consent-id }))
-
-(define-read-only (get-participant-consents (participant principal) (trial-id uint))
-  (map-get? participant-consent-registry { participant: participant, trial-id: trial-id }))
-
-(define-read-only (get-data-access-history (trial-id uint) (participant principal) (accessor principal))
-  (map-get? data-access-log { trial-id: trial-id, participant: participant, accessor: accessor }))
-
-(define-read-only (is-consent-valid (consent-id uint))
-  (match (map-get? data-consent { consent-id: consent-id })
-    consent (and (get active consent) (<= stacks-block-height (get expiry-block consent)))
-    false))
-
-(define-read-only (can-access-data (trial-id uint) (participant principal) (accessor principal) (consent-id uint))
-  (match (map-get? data-consent { consent-id: consent-id })
-    consent (and 
-      (get active consent)
-      (<= stacks-block-height (get expiry-block consent))
-      (is-eq (get participant consent) participant)
-      (is-eq (get trial-id consent) trial-id)
-      (is-some (index-of (get authorized-parties consent) accessor)))
-    false))
