@@ -1,4 +1,4 @@
-(define-fungible-token trial-reward-token)
+﻿(define-fungible-token trial-reward-token)
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_NOT_AUTHORIZED (err u100))
@@ -15,11 +15,19 @@
 (define-constant ERR_CONSENT_NOT_FOUND (err u111))
 (define-constant ERR_DATA_ACCESS_DENIED (err u112))
 (define-constant ERR_INVALID_CONSENT_TYPE (err u113))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u114))
+(define-constant ERR_ALREADY_VOTED (err u115))
+(define-constant ERR_PROPOSAL_EXPIRED (err u116))
+(define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u117))
+(define-constant ERR_INSUFFICIENT_APPROVALS (err u118))
+(define-constant ERR_NOT_VALIDATOR (err u119))
 
 (define-data-var next-trial-id uint u1)
 (define-data-var token-supply uint u1000000)
 (define-data-var reputation-multiplier uint u10)
 (define-data-var next-consent-id uint u1)
+(define-data-var next-proposal-id uint u1)
+(define-data-var required-approvals uint u3)
 
 (define-map trials
   { trial-id: uint }
@@ -118,6 +126,35 @@
     last-access-block: uint,
     data-types-accessed: (string-ascii 300),
     consent-id-used: uint
+  })
+
+(define-map validators
+  { validator: principal }
+  {
+    active: bool,
+    proposals-voted: uint,
+    added-at-block: uint
+  })
+
+(define-map proposals
+  { proposal-id: uint }
+  {
+    proposal-type: (string-ascii 50),
+    trial-id: uint,
+    proposer: principal,
+    target-data: (string-ascii 500),
+    approvals: uint,
+    rejections: uint,
+    executed: bool,
+    expiry-block: uint,
+    created-at-block: uint
+  })
+
+(define-map proposal-votes
+  { proposal-id: uint, validator: principal }
+  {
+    vote: bool,
+    voted-at-block: uint
   })
 
 (define-public (create-trial 
@@ -521,3 +558,128 @@
       (is-eq (get trial-id consent) trial-id)
       (is-some (index-of (get authorized-parties consent) accessor)))
     false))
+
+(define-public (add-validator (validator principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-set validators
+      { validator: validator }
+      {
+        active: true,
+        proposals-voted: u0,
+        added-at-block: stacks-block-height
+      })
+    (ok true)))
+
+(define-public (remove-validator (validator principal))
+  (let
+    ((validator-info (unwrap! (map-get? validators { validator: validator }) ERR_NOT_VALIDATOR)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-set validators
+      { validator: validator }
+      (merge validator-info { active: false }))
+    (ok true)))
+
+(define-public (create-proposal
+  (proposal-type (string-ascii 50))
+  (trial-id uint)
+  (target-data (string-ascii 500))
+  (duration-blocks uint))
+  (let
+    ((proposal-id (var-get next-proposal-id))
+     (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR_TRIAL_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get researcher trial)) ERR_NOT_AUTHORIZED)
+    (map-set proposals
+      { proposal-id: proposal-id }
+      {
+        proposal-type: proposal-type,
+        trial-id: trial-id,
+        proposer: tx-sender,
+        target-data: target-data,
+        approvals: u0,
+        rejections: u0,
+        executed: false,
+        expiry-block: (+ stacks-block-height duration-blocks),
+        created-at-block: stacks-block-height
+      })
+    (var-set next-proposal-id (+ proposal-id u1))
+    (ok proposal-id)))
+
+(define-public (vote-on-proposal (proposal-id uint) (approve bool))
+  (let
+    ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+     (validator-info (unwrap! (map-get? validators { validator: tx-sender }) ERR_NOT_VALIDATOR))
+     (existing-vote (map-get? proposal-votes { proposal-id: proposal-id, validator: tx-sender })))
+    (asserts! (get active validator-info) ERR_NOT_VALIDATOR)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    (asserts! (<= stacks-block-height (get expiry-block proposal)) ERR_PROPOSAL_EXPIRED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (map-set proposal-votes
+      { proposal-id: proposal-id, validator: tx-sender }
+      {
+        vote: approve,
+        voted-at-block: stacks-block-height
+      })
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal {
+        approvals: (if approve (+ (get approvals proposal) u1) (get approvals proposal)),
+        rejections: (if approve (get rejections proposal) (+ (get rejections proposal) u1))
+      }))
+    (map-set validators
+      { validator: tx-sender }
+      (merge validator-info { proposals-voted: (+ (get proposals-voted validator-info) u1) }))
+    (ok true)))
+
+(define-public (execute-proposal (proposal-id uint))
+  (let
+    ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get proposer proposal)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (get approvals proposal) (var-get required-approvals)) ERR_INSUFFICIENT_APPROVALS)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (<= stacks-block-height (get expiry-block proposal)) ERR_PROPOSAL_EXPIRED)
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true }))
+    (ok true)))
+
+(define-public (update-required-approvals (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set required-approvals new-threshold)
+    (ok true)))
+
+(define-read-only (get-validator-info (validator principal))
+  (map-get? validators { validator: validator }))
+
+(define-read-only (is-active-validator (validator principal))
+  (match (map-get? validators { validator: validator })
+    validator-info (get active validator-info)
+    false))
+
+(define-read-only (get-proposal-info (proposal-id uint))
+  (map-get? proposals { proposal-id: proposal-id }))
+
+(define-read-only (get-proposal-vote (proposal-id uint) (validator principal))
+  (map-get? proposal-votes { proposal-id: proposal-id, validator: validator }))
+
+(define-read-only (get-proposal-status (proposal-id uint))
+  (match (map-get? proposals { proposal-id: proposal-id })
+    proposal (some {
+      approvals: (get approvals proposal),
+      rejections: (get rejections proposal),
+      required-approvals: (var-get required-approvals),
+      can-execute: (and 
+        (>= (get approvals proposal) (var-get required-approvals))
+        (not (get executed proposal))
+        (<= stacks-block-height (get expiry-block proposal))),
+      executed: (get executed proposal),
+      expired: (> stacks-block-height (get expiry-block proposal))
+    })
+    none))
+
+(define-read-only (get-total-proposals)
+  (- (var-get next-proposal-id) u1))
+
+(define-read-only (get-required-approvals)
+  (var-get required-approvals))
